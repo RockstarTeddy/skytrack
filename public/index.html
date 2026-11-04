@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkyTrack</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#0b1220;--panel:#121b2e;--line:#22304d;--tx:#e8edf6;--mu:#8b9ab5;--ac:#38bdf8}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:14px system-ui,sans-serif}
+#map{position:absolute;inset:0;background:var(--bg)}
+.bar{position:absolute;z-index:1000;top:10px;left:10px;right:10px;display:flex;gap:8px;flex-wrap:wrap;pointer-events:none}
+.bar>*{pointer-events:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+#q{width:230px;color:var(--tx);outline:none}
+#status b{padding:2px 8px;border-radius:99px;font-size:12px;margin-right:6px}
+.LIVE{background:#14532d}.DELAYED{background:#713f12}.STALE{background:#7f1d1d}.UNAVAILABLE{background:#374151}
+#panel{position:absolute;z-index:1000;right:10px;bottom:10px;width:290px;max-width:calc(100% - 20px);background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;display:none}
+#panel h3{margin:0 0 8px;font-size:18px}#panel dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0}
+#panel dt{color:var(--mu)}#panel dd{margin:0;text-align:right}
+#x{position:absolute;top:8px;right:12px;cursor:pointer;color:var(--mu)}
+.ac{background:none;border:0}.ac svg{filter:drop-shadow(0 0 2px #000)}
+.leaflet-container{font:inherit}
+.leaflet-tooltip{background:var(--panel);color:var(--tx);border:1px solid var(--line);box-shadow:none}
+.leaflet-tooltip-top:before{border-top-color:var(--line)}
+.leaflet-tile-pane{filter:invert(1) hue-rotate(200deg) brightness(.85) contrast(.9) saturate(.6)}
+</style></head><body>
+<div id="map"></div>
+<div class="bar">
+  <input id="q" placeholder="Search callsign / ICAO24 in view" autocomplete="off">
+  <div id="status"><b class="UNAVAILABLE" id="badge">…</b><span id="meta">Loading</span></div>
+  <div id="stats"></div>
+</div>
+<div id="panel"><span id="x">✕</span><h3 id="pt"></h3><dl id="pd"></dl><p id="pn" style="color:var(--mu);margin:10px 0 0;font-size:12px"></p></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const POLL_MS = 20000, MIN_ZOOM = 5, MAX_MARKERS = 1500;
+const map = L.map('map', { zoomControl: false, worldCopyJump: true }).setView([3.1, 101.7], 7);
+L.control.zoom({ position: 'bottomleft' }).addTo(map);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors', maxZoom: 12 }).addTo(map);
+
+const routeInfo = {}; const markers = new Map(); let aircraft = [], selected = null, trackLine = null, last = null, busy = false;
+let details = null; const routeLayer = L.layerGroup().addTo(map);
+const $ = id => document.getElementById(id);
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const km = (a, b) => { const r = x => x * Math.PI / 180, dLa = r(b[0] - a[0]), dLo = r(b[1] - a[1]);
+  const h = Math.sin(dLa / 2) ** 2 + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLo / 2) ** 2; return 12742 * Math.asin(Math.sqrt(h)); };
+const apt = p => p ? `${esc(p.iata_code || p.icao_code)} · ${esc(p.municipality || p.name)}` : 'Unavailable';
+const icon = (h, sel, gnd) => L.divIcon({ className: 'ac', iconSize: [22, 22], iconAnchor: [11, 11],
+  html: `<svg width="22" height="22" viewBox="0 0 24 24" style="transform:rotate(${h || 0}deg)"><path fill="${sel ? '#fbbf24' : gnd ? '#64748b' : '#38bdf8'}" d="M12 2l2 7 8 5v2l-8-2v5l2 2v1l-4-1-4 1v-1l2-2v-5l-8 2v-2l8-5z"/></svg>` });
+const fmt = (v, f) => v == null ? 'Unavailable' : f(v);
+
+function render() {
+  const seen = new Set(), view = map.getBounds().pad(0.1);
+  let n = 0;
+  for (const a of aircraft) {
+    if (!view.contains([a.lat, a.lon]) || n++ >= MAX_MARKERS) continue;
+    seen.add(a.icao24);
+    let m = markers.get(a.icao24);
+    if (!m) { m = L.marker([a.lat, a.lon], { icon: icon(a.heading, false, a.onGround) }).on('click', () => select(a.icao24)).addTo(map); markers.set(a.icao24, m); }
+    m.setLatLng([a.lat, a.lon]).setIcon(icon(a.heading, a.icao24 === selected, a.onGround));
+  }
+  for (const [id, m] of markers) if (!seen.has(id)) { map.removeLayer(m); markers.delete(id); }
+  const air = aircraft.filter(a => !a.onGround).length;
+  $('stats').textContent = `${aircraft.length} tracked · ${air} airborne · ${aircraft.length - air} on ground`;
+  if (selected) showPanel();
+}
+
+function showPanel() {
+  const a = aircraft.find(x => x.icao24 === selected);
+  if (!a) { $('pn').textContent = 'Aircraft no longer in the current view/data.'; return; }
+  $('pt').textContent = a.callsign || a.icao24.toUpperCase();
+  const rows = [['ICAO24', a.icao24.toUpperCase()], ['Country (registered)', a.country], ['Altitude', fmt(a.altitudeM, v => `${Math.round(v * 3.281).toLocaleString()} ft`)],
+    ['Ground speed', fmt(a.speedMs, v => `${Math.round(v * 1.944)} kt`)], ['Heading', fmt(a.heading, v => `${Math.round(v)}°`)],
+    ['Vertical speed', fmt(a.vertRateMs, v => `${Math.round(v * 196.85)} ft/min`)], ['Squawk', a.squawk || 'Unavailable'],
+    ['Status', a.onGround ? 'On ground' : 'Airborne'], ['Position', `${a.lat.toFixed(3)}, ${a.lon.toFixed(3)}`],
+    ['Last contact', fmt(a.lastContact, v => `${Math.max(0, Math.round(Date.now() / 1000 - v))}s ago`)], ['Source', a.source]];
+  addDetailRows(a, rows);
+  $('pd').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  const ri = routeInfo[a.icao24];
+  if (ri && ri.available) {
+    const t = v => v || 'Unavailable';
+    $('pd').innerHTML = [['Route', `${t(ri.dep)} → ${t(ri.arr)}`], ['Flight', t(ri.flight)], ['Aircraft', t(ri.aircraft)], ['Registration', t(ri.reg)], ['Departed', t(ri.depTime)], ['Arrives (local)', t(ri.arrTime)]].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + $('pd').innerHTML;
+    $('pn').textContent = 'Route data: ' + ri.source;
+  } else $('pn').textContent = details && details.route
+    ? 'Route from adsbdb.com (callsign database). May not match this exact flight today.'
+    : details ? 'Route unavailable: this callsign is not in the route database.' : 'Looking up route…';
+  drawRoute(a);
+  $('panel').style.display = 'block';
+}
+
+
+function addDetailRows(a, rows) {
+  if (!details) return;
+  const r = details.route, ac = details.aircraft, top = [];
+  if (r) {
+    top.push(['From', apt(r.origin)], ['To', apt(r.destination)]);
+    if (r.airline) top.push(['Airline', esc(r.airline.name)]);
+    if (r.destination && r.destination.latitude != null) {
+      const d = km([a.lat, a.lon], [r.destination.latitude, r.destination.longitude]);
+      top.push(['Distance to go', `${Math.round(d)} km (${Math.round(d / 1.852)} nm)`]);
+    }
+  } else top.push(['From / To', 'Unavailable']);
+  if (ac) top.push(['Aircraft', esc([ac.manufacturer, ac.type].filter(Boolean).join(' ') || 'Unavailable')], ['Registration', esc(ac.registration || 'Unavailable')], ['Operator', esc(ac.registered_owner || 'Unavailable')]);
+  rows.unshift(...top);
+}
+function drawRoute(a) {
+  routeLayer.clearLayers();
+  const r = details && details.route; if (!r) return;
+  const pt = (p, color) => p && p.latitude != null && L.circleMarker([p.latitude, p.longitude], { radius: 6, color, fillOpacity: .9 })
+    .bindTooltip(esc(p.iata_code || p.icao_code), { permanent: true, direction: 'top' }).addTo(routeLayer);
+  pt(r.origin, '#34d399'); pt(r.destination, '#f87171');
+  if (r.destination && r.destination.latitude != null)
+    L.polyline([[a.lat, a.lon], [r.destination.latitude, r.destination.longitude]], { color: '#fbbf24', weight: 1.5, dashArray: '6 6' }).addTo(routeLayer);
+}
+async function loadDetails(id) {
+  const a = aircraft.find(x => x.icao24 === id);
+  try {
+    const j = await (await fetch(`/api/details?icao24=${id}&callsign=${encodeURIComponent((a && a.callsign) || '')}`)).json();
+    if (selected !== id || j.error) return;
+    details = j; showPanel();
+  } catch {}
+}
+
+async function select(id) {
+  selected = id; details = null; routeLayer.clearLayers(); render(); showPanel(); loadDetails(id);
+  if (trackLine) { map.removeLayer(trackLine); trackLine = null; }
+  const ac = aircraft.find(x => x.icao24 === id);
+  if (!routeInfo[id] && ac) fetch(`/api/route?callsign=${encodeURIComponent(ac.callsign || '')}&icao24=${id}`).then(r => r.json()).then(j => { routeInfo[id] = j; if (selected === id) showPanel(); }).catch(() => { routeInfo[id] = { available: false, reason: 'Route lookup failed.' }; showPanel(); });
+  try {
+    const r = await (await fetch('/api/track?icao24=' + id)).json();
+    if (selected === id && r.path && r.path.length > 1) trackLine = L.polyline(r.path.map(p => [p.lat, p.lon]).filter(p => p[0] != null), { color: '#fbbf24', weight: 2 }).addTo(map);
+  } catch {}
+}
+$('x').onclick = () => { details = null; routeLayer.clearLayers(); selected = null; $('panel').style.display = 'none'; if (trackLine) map.removeLayer(trackLine); render(); };
+
+function setStatus(state, text) { $('badge').className = state; $('badge').textContent = state; $('meta').textContent = text; }
+function freshness() {
+  if (!last) return;
+  const age = (Date.now() - last.apiTime) / 1000, t = new Date(last.apiTime).toLocaleTimeString();
+  if (last.warning) return setStatus(age < 120 ? 'DELAYED' : 'STALE', `Last data ${t} · ${last.warning}`);
+  setStatus(age < 60 ? 'LIVE' : age < 180 ? 'DELAYED' : 'STALE', `Data time ${t} (${Math.round(age)}s old)`);
+}
+
+async function poll() {
+  if (busy) return;
+  if (map.getZoom() < MIN_ZOOM) { setStatus('UNAVAILABLE', 'Zoom in to load aircraft'); return; }
+  busy = true;
+  const b = map.getBounds().pad(0.1);
+  const p = new URLSearchParams({ lamin: b.getSouth(), lomin: b.getWest(), lamax: b.getNorth(), lomax: b.getEast() });
+  try {
+    const r = await fetch('/api/aircraft?' + p);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    last = j; aircraft = j.aircraft; render(); freshness();
+  } catch (e) { setStatus(last ? 'STALE' : 'UNAVAILABLE', e.message); }
+  busy = false;
+}
+
+$('q').addEventListener('input', e => {
+  const s = e.target.value.trim().toLowerCase(); if (s.length < 3) return;
+  const a = aircraft.find(x => (x.callsign || '').toLowerCase().includes(s) || x.icao24.includes(s));
+  if (a) { map.flyTo([a.lat, a.lon], Math.max(map.getZoom(), 8)); select(a.icao24); }
+});
+let t; map.on('moveend', () => { clearTimeout(t); t = setTimeout(poll, 600); render(); });
+setInterval(poll, POLL_MS); setInterval(freshness, 5000); poll();
+</script></body></html>
