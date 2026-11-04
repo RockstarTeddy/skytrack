@@ -127,16 +127,85 @@ async function select(id) {
   if (!routeInfo[id] && ac) fetch(`/api/route?callsign=${encodeURIComponent(ac.callsign || '')}&icao24=${id}`).then(r => r.json()).then(j => { routeInfo[id] = j; if (selected === id) showPanel(); }).catch(() => { routeInfo[id] = { available: false, reason: 'Route lookup failed.' }; showPanel(); });
   loadTrack(id);
 }
-let trackLocal = false;
-async function loadTrack(id) {
-  try {
-    const r = await (await fetch('/api/track?icao24=' + id)).json();
-    if (selected !== id) return;
-    trackLocal = !!r.recorded;
-    if (trackLine) { map.removeLayer(trackLine); trackLine = null; }
-    if (r.path && r.path.length > 1) trackLine = L.polyline(r.path.map(p => [p.lat, p.lon]).filter(p => p[0] != null), { color: '#fbbf24', weight: 2 }).addTo(map);
-  } catch {}
+const num = v => (typeof v === 'number' && isFinite(v) ? v : null);
+const mulN = (v, k) => (num(v) === null ? null : v * k);
+async function getJson(url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+  return r.json();
 }
+function adsbSource(name, base) {
+  return { name, until: 0, async get(b) {
+    const S = b.getSouth(), N = b.getNorth(), W = b.getWest(), E = b.getEast();
+    const clat = Math.round((S + N) / 2 * 2) / 2, clon = Math.round((W + E) / 2 * 2) / 2;
+    const need = Math.max(km([clat, clon], [S, W]), km([clat, clon], [N, E]), km([clat, clon], [S, E]), km([clat, clon], [N, W])) / 1.852;
+    const radius = Math.min(250, Math.max(25, Math.ceil(need / 25) * 25));
+    const d = await getJson(`${base}/point/${clat}/${clon}/${radius}`);
+    const nowMs = num(d.now) || Date.now();
+    const aircraft = (d.ac || []).filter(a => /^[0-9a-f]{6}$/i.test(a.hex || '') && num(a.lat) !== null && num(a.lon) !== null && a.lat >= S && a.lat <= N && a.lon >= W && a.lon <= E)
+      .map(a => { const g = a.alt_baro === 'ground'; return { icao24: a.hex.toLowerCase(), callsign: (a.flight || '').trim() || null, country: 'Unavailable',
+        lastContact: Math.round(nowMs / 1000 - (num(a.seen_pos) ?? num(a.seen) ?? 0)), lon: a.lon, lat: a.lat,
+        altitudeM: g ? 0 : mulN(num(a.alt_baro) ?? num(a.alt_geom), 0.3048), onGround: g, speedMs: mulN(a.gs, 1 / 1.944),
+        heading: num(a.track), vertRateMs: mulN(a.baro_rate, 0.00508), squawk: a.squawk || null, source: name }; });
+    return { apiTime: nowMs, warning: null, provider: name + ' (direct)', aircraft };
+  } };
+}
+// Sources are tried in order from the visitor's own browser; the server is the last resort.
+const SRC = [
+  { name: 'OpenSky Network', until: 0, async get(b) {
+    const d = await getJson(`https://opensky-network.org/api/states/all?lamin=${b.getSouth().toFixed(1)}&lomin=${b.getWest().toFixed(1)}&lamax=${b.getNorth().toFixed(1)}&lomax=${b.getEast().toFixed(1)}`);
+    const aircraft = (d.states || []).map(s => ({ icao24: s[0], callsign: (s[1] || '').trim() || null, country: s[2], lastContact: num(s[4]), lon: num(s[5]), lat: num(s[6]),
+      altitudeM: num(s[7]) ?? num(s[13]), onGround: !!s[8], speedMs: num(s[9]), heading: num(s[10]), vertRateMs: num(s[11]), squawk: s[14] || null, source: 'OpenSky Network' }))
+      .filter(a => a.lat !== null && a.lon !== null);
+    return { apiTime: d.time * 1000, warning: null, provider: 'OpenSky Network (direct)', aircraft };
+  } },
+  adsbSource('adsb.lol', 'https://api.adsb.lol/v2'),
+  adsbSource('airplanes.live', 'https://api.airplanes.live/v2')
+];
+async function getAircraft(b, p) {
+  for (const s of SRC) {
+    if (Date.now() < s.until) continue;
+    try { return await s.get(b); }
+    catch (e) { s.until = Date.now() + (e.status === 429 ? 60000 : e instanceof TypeError ? 300000 : 120000); }
+  }
+  const r = await fetch('/api/aircraft?' + p);
+  const j = await r.json(); if (!r.ok) throw new Error(j.error);
+  return j;
+}
+
+// Trails: remembered in this browser, plus full history from OpenSky when reachable.
+const clientTrails = new Map(), trackBase = {};
+function recordClient(list, tMs) {
+  const t = Math.round(tMs / 1000);
+  for (const a of list) {
+    let tr = clientTrails.get(a.icao24); if (!tr) { tr = []; clientTrails.set(a.icao24, tr); }
+    const l = tr[tr.length - 1];
+    if (l && Math.abs(l.lat - a.lat) < 0.001 && Math.abs(l.lon - a.lon) < 0.001) continue;
+    tr.push({ t, lat: a.lat, lon: a.lon }); if (tr.length > 300) tr.shift();
+  }
+  if (clientTrails.size > 4000) for (const k of clientTrails.keys()) { if (clientTrails.size <= 3000) break; clientTrails.delete(k); }
+}
+function drawTrack(id) {
+  const base = trackBase[id] || [], lastT = base.length ? base[base.length - 1].t : 0;
+  const pts = base.concat((clientTrails.get(id) || []).filter(p => p.t > lastT)).map(p => [p.lat, p.lon]);
+  const a = aircraft.find(x => x.icao24 === id); if (a) pts.push([a.lat, a.lon]);
+  if (trackLine) { map.removeLayer(trackLine); trackLine = null; }
+  if (pts.length > 1) trackLine = L.polyline(pts, { color: '#fbbf24', weight: 2 }).addTo(map);
+}
+async function loadTrack(id) {
+  let path = [];
+  if (Date.now() >= SRC[0].until) {
+    try { const j = await getJson(`https://opensky-network.org/api/tracks/all?icao24=${id}&time=0`);
+      path = (j.path || []).map(p => ({ t: p[0], lat: p[1], lon: p[2] })).filter(p => p.lat != null); } catch {}
+  }
+  if (path.length < 2) {
+    try { const j = await (await fetch('/api/track?icao24=' + id)).json();
+      path = (j.path || []).map(p => ({ t: p.t, lat: p.lat, lon: p.lon })).filter(p => p.lat != null); } catch {}
+  }
+  if (selected !== id) return;
+  trackBase[id] = path; drawTrack(id);
+}
+
 $('x').onclick = () => { details = null; routeLayer.clearLayers(); selected = null; $('panel').style.display = 'none'; if (trackLine) map.removeLayer(trackLine); render(); };
 
 function setStatus(state, text) { $('badge').className = state; $('badge').textContent = state; $('meta').textContent = text; }
@@ -144,7 +213,7 @@ function freshness() {
   if (!last) return;
   const age = (Date.now() - last.apiTime) / 1000, t = new Date(last.apiTime).toLocaleTimeString();
   if (last.warning) return setStatus(age < 120 ? 'DELAYED' : 'STALE', `Last data ${t} · ${last.warning}`);
-  setStatus(age < 60 ? 'LIVE' : age < 180 ? 'DELAYED' : 'STALE', `Data time ${t} (${Math.round(age)}s old)`);
+  setStatus(age < 60 ? 'LIVE' : age < 180 ? 'DELAYED' : 'STALE', `Data time ${t} (${Math.round(age)}s old) · ${last.provider || ''}`);
 }
 
 async function poll() {
@@ -154,10 +223,8 @@ async function poll() {
   const b = map.getBounds().pad(0.1);
   const p = new URLSearchParams({ lamin: b.getSouth(), lomin: b.getWest(), lamax: b.getNorth(), lomax: b.getEast() });
   try {
-    const r = await fetch('/api/aircraft?' + p);
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error);
-    last = j; aircraft = j.aircraft; render(); freshness(); if (selected && trackLocal) loadTrack(selected);
+    const j = await getAircraft(b, p);
+    last = j; aircraft = j.aircraft; recordClient(aircraft, j.apiTime); render(); freshness(); if (selected) drawTrack(selected);
   } catch (e) { setStatus(last ? 'STALE' : 'UNAVAILABLE', e.message); }
   busy = false;
 }
