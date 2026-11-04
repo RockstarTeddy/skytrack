@@ -141,7 +141,7 @@ function freshness() {
 }
 
 async function poll() {
-  if (busy) return;
+  if (busy || document.hidden) return;
   if (map.getZoom() < MIN_ZOOM) { setStatus('UNAVAILABLE', 'Zoom in to load aircraft'); return; }
   busy = true;
   const b = map.getBounds().pad(0.1);

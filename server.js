@@ -74,17 +74,35 @@ async function adsbdb(p) {
 let osDownUntil = 0;
 const hav = (a, b, c, d) => { const r = x => x * Math.PI / 180, h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2; return 12742 * Math.asin(Math.sqrt(h)); };
 const mul = (v, k) => (num(v) === null ? null : v * k);
+const ADSB_HOSTS = [
+  { name: 'adsb.lol', base: 'https://api.adsb.lol/v2', until: 0 },
+  { name: 'airplanes.live', base: 'https://api.airplanes.live/v2', until: 0 }
+];
 async function adsbLol(lamin, lomin, lamax, lomax) {
-  const clat = (lamin + lamax) / 2, clon = (lomin + lomax) / 2;
-  const radius = Math.min(250, Math.max(10, Math.ceil(Math.max(hav(clat, clon, lamin, lomin), hav(clat, clon, lamax, lomax)) / 1.852)));
-  const key = `adsb:${clat.toFixed(1)},${clon.toFixed(1)},${radius}`;
+  // Snap the search centre to a 0.5 degree grid and the radius to 25 nm steps so many map views share one cached request.
+  const clat = Math.round((lamin + lamax) / 2 * 2) / 2, clon = Math.round((lomin + lomax) / 2 * 2) / 2;
+  const need = Math.max(hav(clat, clon, lamin, lomin), hav(clat, clon, lamax, lomax), hav(clat, clon, lamin, lomax), hav(clat, clon, lamax, lomin)) / 1.852;
+  const radius = Math.min(250, Math.max(25, Math.ceil(need / 25) * 25));
+  const key = `adsb:${clat},${clon},${radius}`;
   const hit = cache.get(key);
-  let data, t;
-  if (hit && Date.now() - hit.t < CACHE_MS) { data = hit.data; t = hit.t; }
+  let data, t, provider, warning = null, fresh = false;
+  if (hit && Date.now() - hit.t < 15000) { data = hit.data; t = hit.t; provider = hit.provider; }
   else {
-    const r = await fetch(`https://api.adsb.lol/v2/point/${clat.toFixed(3)}/${clon.toFixed(3)}/${radius}`, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) throw new Error('adsb.lol error ' + r.status);
-    data = await r.json(); t = Date.now(); cache.set(key, { t, data });
+    let lastErr;
+    for (const h of ADSB_HOSTS) {
+      if (Date.now() < h.until) { lastErr = lastErr || new Error(h.name + ' is rate limiting, waiting'); continue; }
+      try {
+        const r = await fetch(`${h.base}/point/${clat}/${clon}/${radius}`, { signal: AbortSignal.timeout(8000) });
+        if (r.status === 429) { h.until = Date.now() + Math.min(60000, (Number(r.headers.get('retry-after')) || 30) * 1000); throw new Error(h.name + ' rate limit (429)'); }
+        if (!r.ok) throw new Error(h.name + ' error ' + r.status);
+        data = await r.json(); t = Date.now(); provider = h.name; fresh = true;
+        cache.set(key, { t, data, provider }); break;
+      } catch (e) { lastErr = e; console.log('backup source failed: ' + e.message); }
+    }
+    if (!data) {
+      if (hit && Date.now() - hit.t < 180000) { data = hit.data; t = hit.t; provider = hit.provider; warning = lastErr ? lastErr.message : 'Sources unavailable'; }
+      else throw lastErr || new Error('Backup sources unavailable, try again shortly');
+    }
   }
   const nowMs = num(data.now) || t;
   const aircraft = (data.ac || [])
@@ -93,8 +111,8 @@ async function adsbLol(lamin, lomin, lamax, lomax) {
       return { icao24: a.hex.toLowerCase(), callsign: (a.flight || '').trim() || null, country: 'Unavailable',
         lastContact: Math.round(nowMs / 1000 - (num(a.seen_pos) ?? num(a.seen) ?? 0)), lon: a.lon, lat: a.lat,
         altitudeM: gnd ? 0 : mul(num(a.alt_baro) ?? num(a.alt_geom), 0.3048), onGround: gnd, speedMs: mul(a.gs, 1 / 1.944),
-        heading: num(a.track), vertRateMs: mul(a.baro_rate, 0.00508), squawk: a.squawk || null, source: 'adsb.lol' }; });
-  return { apiTime: nowMs, fetchedAt: t, cached: !!hit && t === hit.t, warning: null, count: aircraft.length, aircraft, provider: 'adsb.lol' };
+        heading: num(a.track), vertRateMs: mul(a.baro_rate, 0.00508), squawk: a.squawk || null, source: provider }; });
+  return { apiTime: nowMs, fetchedAt: t, cached: !fresh, warning, count: aircraft.length, aircraft, provider };
 }
 
 const json = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
