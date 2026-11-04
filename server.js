@@ -35,7 +35,7 @@ async function cached(key, url) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.t < CACHE_MS) return { data: hit.data, fetchedAt: hit.t, cached: true };
   try {
-    const res = await fetch(url, { headers: await authHeaders() });
+    const res = await fetch(url, { headers: await authHeaders(), signal: AbortSignal.timeout(8000) });
     if (res.status === 429) throw new Error('Rate limit reached (OpenSky 429)');
     if (!res.ok) throw new Error('OpenSky error ' + res.status);
     const data = await res.json();
@@ -70,6 +70,33 @@ async function adsbdb(p) {
   return v;
 }
 
+// Backup source: adsb.lol (free, community ADS-B). Used when OpenSky is unreachable (common from cloud hosts).
+let osDownUntil = 0;
+const hav = (a, b, c, d) => { const r = x => x * Math.PI / 180, h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2; return 12742 * Math.asin(Math.sqrt(h)); };
+const mul = (v, k) => (num(v) === null ? null : v * k);
+async function adsbLol(lamin, lomin, lamax, lomax) {
+  const clat = (lamin + lamax) / 2, clon = (lomin + lomax) / 2;
+  const radius = Math.min(250, Math.max(10, Math.ceil(Math.max(hav(clat, clon, lamin, lomin), hav(clat, clon, lamax, lomax)) / 1.852)));
+  const key = `adsb:${clat.toFixed(1)},${clon.toFixed(1)},${radius}`;
+  const hit = cache.get(key);
+  let data, t;
+  if (hit && Date.now() - hit.t < CACHE_MS) { data = hit.data; t = hit.t; }
+  else {
+    const r = await fetch(`https://api.adsb.lol/v2/point/${clat.toFixed(3)}/${clon.toFixed(3)}/${radius}`, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error('adsb.lol error ' + r.status);
+    data = await r.json(); t = Date.now(); cache.set(key, { t, data });
+  }
+  const nowMs = num(data.now) || t;
+  const aircraft = (data.ac || [])
+    .filter(a => /^[0-9a-f]{6}$/i.test(a.hex || '') && num(a.lat) !== null && num(a.lon) !== null && a.lat >= lamin && a.lat <= lamax && a.lon >= lomin && a.lon <= lomax)
+    .map(a => { const gnd = a.alt_baro === 'ground';
+      return { icao24: a.hex.toLowerCase(), callsign: (a.flight || '').trim() || null, country: 'Unavailable',
+        lastContact: Math.round(nowMs / 1000 - (num(a.seen_pos) ?? num(a.seen) ?? 0)), lon: a.lon, lat: a.lat,
+        altitudeM: gnd ? 0 : mul(num(a.alt_baro) ?? num(a.alt_geom), 0.3048), onGround: gnd, speedMs: mul(a.gs, 1 / 1.944),
+        heading: num(a.track), vertRateMs: mul(a.baro_rate, 0.00508), squawk: a.squawk || null, source: 'adsb.lol' }; });
+  return { apiTime: nowMs, fetchedAt: t, cached: !!hit && t === hit.t, warning: null, count: aircraft.length, aircraft, provider: 'adsb.lol' };
+}
+
 const json = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
 const inRange = (v, lo, hi) => isFinite(v) && v >= lo && v <= hi;
 
@@ -81,14 +108,23 @@ const server = http.createServer(async (req, res) => {
       if (!inRange(q[0], -90, 90) || !inRange(q[2], -90, 90) || !inRange(q[1], -180, 180) || !inRange(q[3], -180, 180))
         return json(res, 400, { error: 'Invalid bounding box' });
       const [lamin, lomin, lamax, lomax] = q.map(n => n.toFixed(1)); // round so nearby views share cache
-      const r = await cached(`bb:${lamin},${lomin},${lamax},${lomax}`,
-        `${API}/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`);
-      const aircraft = (r.data.states || []).map(normalize).filter(a => a.lat !== null && a.lon !== null);
-      return json(res, 200, { apiTime: r.data.time * 1000, fetchedAt: r.fetchedAt, cached: r.cached, warning: r.error || null, count: aircraft.length, aircraft });
+      let body = null;
+      if (Date.now() >= osDownUntil) {
+        try {
+          const r = await cached(`bb:${lamin},${lomin},${lamax},${lomax}`,
+            `${API}/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`);
+          if (r.error) throw new Error(r.error);
+          const aircraft = (r.data.states || []).map(normalize).filter(a => a.lat !== null && a.lon !== null);
+          body = { apiTime: r.data.time * 1000, fetchedAt: r.fetchedAt, cached: r.cached, warning: null, count: aircraft.length, aircraft, provider: 'OpenSky Network' };
+        } catch (e) { osDownUntil = Date.now() + 120000; console.log('OpenSky failed (' + e.message + '), using adsb.lol for 2 min'); }
+      }
+      if (!body) body = await adsbLol(q[0], q[1], q[2], q[3]);
+      return json(res, 200, body);
     }
     if (u.pathname === '/api/track') {
       const id = (u.searchParams.get('icao24') || '').toLowerCase();
       if (!/^[0-9a-f]{6}$/.test(id)) return json(res, 400, { error: 'Invalid ICAO24' });
+      if (Date.now() < osDownUntil) return json(res, 200, { path: [] });
       const r = await cached('tr:' + id, `${API}/tracks/all?icao24=${id}&time=0`);
       return json(res, 200, { callsign: r.data.callsign, start: r.data.startTime, end: r.data.endTime, path: (r.data.path || []).map(p => ({ t: p[0], lat: p[1], lon: p[2], altM: p[3], heading: p[4], onGround: p[5] })) });
     }
