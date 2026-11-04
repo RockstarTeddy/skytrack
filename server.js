@@ -62,7 +62,7 @@ const detCache = new Map();
 async function adsbdb(p) {
   const hit = detCache.get(p);
   if (hit && Date.now() - hit.t < 6 * 3600e3) return hit.v;
-  const r = await fetch('https://api.adsbdb.com/v0/' + p);
+  const r = await fetch('https://api.adsbdb.com/v0/' + p, { headers: UA });
   let v = null;
   if (r.ok) { const j = await r.json(); v = j && typeof j.response === 'object' ? j.response : null; }
   else if (r.status !== 404) throw new Error('adsbdb error ' + r.status);
@@ -92,7 +92,7 @@ async function adsbLol(lamin, lomin, lamax, lomax) {
     for (const h of ADSB_HOSTS) {
       if (Date.now() < h.until) { lastErr = lastErr || new Error(h.name + ' is rate limiting, waiting'); continue; }
       try {
-        const r = await fetch(`${h.base}/point/${clat}/${clon}/${radius}`, { signal: AbortSignal.timeout(8000) });
+        const r = await fetch(`${h.base}/point/${clat}/${clon}/${radius}`, { headers: UA, signal: AbortSignal.timeout(8000) });
         if (r.status === 429) { h.until = Date.now() + Math.min(60000, (Number(r.headers.get('retry-after')) || 30) * 1000); throw new Error(h.name + ' rate limit (429)'); }
         if (!r.ok) throw new Error(h.name + ' error ' + r.status);
         data = await r.json(); t = Date.now(); provider = h.name; fresh = true;
@@ -114,6 +114,27 @@ async function adsbLol(lamin, lomin, lamax, lomax) {
         heading: num(a.track), vertRateMs: mul(a.baro_rate, 0.00508), squawk: a.squawk || null, source: provider }; });
   return { apiTime: nowMs, fetchedAt: t, cached: !fresh, warning, count: aircraft.length, aircraft, provider };
 }
+
+// Trail recorder: remembers positions this server has seen, so a path can be drawn without OpenSky history.
+const trails = new Map(); // icao24 -> [[tMs, lat, lon, altM, heading], ...]
+function recordTrails(list, tMs) {
+  for (const a of list) {
+    if (a.lat == null || a.lon == null) continue;
+    let tr = trails.get(a.icao24);
+    if (!tr) { tr = []; trails.set(a.icao24, tr); }
+    const last = tr[tr.length - 1];
+    if (last && Math.abs(last[1] - a.lat) < 0.001 && Math.abs(last[2] - a.lon) < 0.001) { last[0] = tMs; continue; }
+    if (last && tMs - last[0] < 4000) continue;
+    tr.push([tMs, a.lat, a.lon, a.altitudeM, a.heading]);
+    if (tr.length > 400) tr.shift();
+  }
+  if (trails.size > 5000) {
+    const cut = Date.now() - 3600e3;
+    for (const [k, v] of trails) if (v[v.length - 1][0] < cut) trails.delete(k);
+    for (const k of trails.keys()) { if (trails.size <= 4000) break; trails.delete(k); }
+  }
+}
+const UA = { 'User-Agent': 'SkyTrack/0.1 (personal flight tracker project)' };
 
 const json = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
 const inRange = (v, lo, hi) => isFinite(v) && v >= lo && v <= hi;
@@ -137,13 +158,16 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { osDownUntil = Date.now() + 120000; console.log('OpenSky failed (' + e.message + '), using adsb.lol for 2 min'); }
       }
       if (!body) body = await adsbLol(q[0], q[1], q[2], q[3]);
+      recordTrails(body.aircraft, body.apiTime);
       return json(res, 200, body);
     }
     if (u.pathname === '/api/track') {
       const id = (u.searchParams.get('icao24') || '').toLowerCase();
       if (!/^[0-9a-f]{6}$/.test(id)) return json(res, 400, { error: 'Invalid ICAO24' });
-      if (Date.now() < osDownUntil) return json(res, 200, { path: [] });
-      const r = await cached('tr:' + id, `${API}/tracks/all?icao24=${id}&time=0`);
+      const local = () => ({ callsign: null, recorded: true, path: (trails.get(id) || []).map(p => ({ t: Math.round(p[0] / 1000), lat: p[1], lon: p[2], altM: p[3], heading: p[4], onGround: false })) });
+      if (Date.now() < osDownUntil) return json(res, 200, local());
+      let r;
+      try { r = await cached('tr:' + id, `${API}/tracks/all?icao24=${id}&time=0`); } catch (e) { return json(res, 200, local()); }
       return json(res, 200, { callsign: r.data.callsign, start: r.data.startTime, end: r.data.endTime, path: (r.data.path || []).map(p => ({ t: p[0], lat: p[1], lon: p[2], altM: p[3], heading: p[4], onGround: p[5] })) });
     }
     if (u.pathname === '/api/route') {
