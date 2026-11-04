@@ -150,7 +150,8 @@ function adsbSource(name, base) {
     return { apiTime: nowMs, warning: null, provider: name + ' (direct)', aircraft };
   } };
 }
-// Sources are tried in order from the visitor's own browser; the server is the last resort.
+// Browser-direct fetching is OFF: OpenSky, adsb.lol and airplanes.live all block cross-site browser requests (CORS).
+const DIRECT = false;
 const SRC = [
   { name: 'OpenSky Network', until: 0, async get(b) {
     const d = await getJson(`https://opensky-network.org/api/states/all?lamin=${b.getSouth().toFixed(1)}&lomin=${b.getWest().toFixed(1)}&lamax=${b.getNorth().toFixed(1)}&lomax=${b.getEast().toFixed(1)}`);
@@ -163,7 +164,7 @@ const SRC = [
   adsbSource('airplanes.live', 'https://api.airplanes.live/v2')
 ];
 async function getAircraft(b, p) {
-  for (const s of SRC) {
+  for (const s of (DIRECT ? SRC : [])) {
     if (Date.now() < s.until) continue;
     try { return await s.get(b); }
     catch (e) { s.until = Date.now() + (e.status === 429 ? 60000 : e instanceof TypeError ? 300000 : 120000); }
@@ -194,7 +195,7 @@ function drawTrack(id) {
 }
 async function loadTrack(id) {
   let path = [];
-  if (Date.now() >= SRC[0].until) {
+  if (DIRECT && Date.now() >= SRC[0].until) {
     try { const j = await getJson(`https://opensky-network.org/api/tracks/all?icao24=${id}&time=0`);
       path = (j.path || []).map(p => ({ t: p[0], lat: p[1], lon: p[2] })).filter(p => p.lat != null); } catch {}
   }

@@ -75,6 +75,7 @@ let osDownUntil = 0;
 const hav = (a, b, c, d) => { const r = x => x * Math.PI / 180, h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2; return 12742 * Math.asin(Math.sqrt(h)); };
 const mul = (v, k) => (num(v) === null ? null : v * k);
 const ADSB_HOSTS = [
+  { name: 'adsb.fi', base: 'https://opendata.adsb.fi/api/v2', path: (la, lo, r) => `/lat/${la}/lon/${lo}/dist/${r}`, until: 0 },
   { name: 'adsb.lol', base: 'https://api.adsb.lol/v2', until: 0 },
   { name: 'airplanes.live', base: 'https://api.airplanes.live/v2', until: 0 }
 ];
@@ -92,12 +93,12 @@ async function adsbLol(lamin, lomin, lamax, lomax) {
     for (const h of ADSB_HOSTS) {
       if (Date.now() < h.until) { lastErr = lastErr || new Error(h.name + ' is rate limiting, waiting'); continue; }
       try {
-        const r = await fetch(`${h.base}/point/${clat}/${clon}/${radius}`, { headers: UA, signal: AbortSignal.timeout(8000) });
+        const r = await fetch(`${h.base}${h.path ? h.path(clat, clon, radius) : `/point/${clat}/${clon}/${radius}`}`, { headers: UA, signal: AbortSignal.timeout(8000) });
         if (r.status === 429) { h.until = Date.now() + Math.min(60000, (Number(r.headers.get('retry-after')) || 30) * 1000); throw new Error(h.name + ' rate limit (429)'); }
         if (!r.ok) throw new Error(h.name + ' error ' + r.status);
         data = await r.json(); t = Date.now(); provider = h.name; fresh = true;
         cache.set(key, { t, data, provider }); break;
-      } catch (e) { lastErr = e; console.log('backup source failed: ' + e.message); }
+      } catch (e) { lastErr = e; h.until = Math.max(h.until, Date.now() + 30000); console.log('backup source failed: ' + e.message); }
     }
     if (!data) {
       if (hit && Date.now() - hit.t < 180000) { data = hit.data; t = hit.t; provider = hit.provider; warning = lastErr ? lastErr.message : 'Sources unavailable'; }
@@ -105,7 +106,7 @@ async function adsbLol(lamin, lomin, lamax, lomax) {
     }
   }
   const nowMs = num(data.now) || t;
-  const aircraft = (data.ac || [])
+  const aircraft = (data.ac || data.aircraft || [])
     .filter(a => /^[0-9a-f]{6}$/i.test(a.hex || '') && num(a.lat) !== null && num(a.lon) !== null && a.lat >= lamin && a.lat <= lamax && a.lon >= lomin && a.lon <= lomax)
     .map(a => { const gnd = a.alt_baro === 'ground';
       return { icao24: a.hex.toLowerCase(), callsign: (a.flight || '').trim() || null, country: 'Unavailable',
