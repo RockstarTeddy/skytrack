@@ -220,7 +220,7 @@ function freshness() {
 async function poll() {
   if (busy || document.hidden) return;
   if (map.getZoom() < MIN_ZOOM) { setStatus('UNAVAILABLE', 'Zoom in to load aircraft'); return; }
-  busy = true;
+  busy = true; lastPoll = Date.now();
   const b = map.getBounds().pad(0.1);
   const p = new URLSearchParams({ lamin: b.getSouth(), lomin: b.getWest(), lamax: b.getNorth(), lomax: b.getEast() });
   try {
@@ -235,6 +235,7 @@ $('q').addEventListener('input', e => {
   const a = aircraft.find(x => (x.callsign || '').toLowerCase().includes(s) || x.icao24.includes(s));
   if (a) { map.flyTo([a.lat, a.lon], Math.max(map.getZoom(), 8)); select(a.icao24); }
 });
-let t; map.on('moveend', () => { clearTimeout(t); t = setTimeout(poll, 600); render(); });
+let t, lastPoll = 0;
+map.on('moveend', () => { clearTimeout(t); t = setTimeout(poll, Math.max(2000, lastPoll + 10000 - Date.now())); render(); });
 setInterval(poll, POLL_MS); setInterval(freshness, 5000); poll();
 </script></body></html>
